@@ -1,10 +1,10 @@
 /**
- * slave_basic.ino — RadioTransport slave example (no Modbus)
+ * slave_basic_with_callback.ino — RadioTransport slave callback example (no Modbus)
  *
  * Demonstrates:
  *  - HC12Driver configuration on slave side
- *  - Receiving arbitrary data from master and echoing it back
- *  - Responding to PING broadcasts with a PONG
+ *  - Receiving arbitrary data from master using a callback
+ *  - Echoing data back and responding to PING broadcasts with a PONG
  *
  * Wiring:
  *   ESP32 GPIO17 (TX1) -> HC-12 RX
@@ -25,6 +25,30 @@ static constexpr uint8_t MY_RADIO_ADDR = 0x10;
 // --- Objects ---
 HC12Driver radio;
 RadioTransport transport;
+
+// Callback function for asynchronous packet reception
+void onPacketReceived(uint8_t src, PacketType type, const uint8_t* data, uint8_t len) {
+    switch (type) {
+        case PacketType::DATA:
+            // Echo the payload back to sender
+            Serial.printf("[SLAVE] DATA from 0x%02X (%d bytes) -> echoing\n", src, len);
+            transport.send(src, PacketType::DATA, data, len);
+            break;
+
+        case PacketType::PING:
+            // Reply with a PONG (transport handles ACK; PING is delivered here)
+            Serial.printf("[SLAVE] PING from 0x%02X -> PONG\n", src);
+            {
+                // Payload: [my_radio_addr, 0 devices in basic example]
+                uint8_t pong[2] = {MY_RADIO_ADDR, 0};
+                transport.send(src, PacketType::PONG, pong, 2);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
 
 void setup() {
     Serial.begin(115200);
@@ -53,39 +77,15 @@ void setup() {
     tCfg.autoPowerEnabled = false;  // slaves typically don't auto-adjust
 
     transport.begin(&radio, tCfg);
+
+    // Register the callback function to handle incoming messages
+    transport.onReceive(onPacketReceived);
+
     Serial.printf("[SLAVE 0x%02X] Transport ready\n", MY_RADIO_ADDR);
 }
 
 void loop() {
     transport.update();
-
-    uint8_t src;
-    PacketType type;
-    uint8_t data[RADIO_MAX_PAYLOAD];
-    uint8_t len;
-
-    while (transport.receive(&src, &type, data, &len)) {
-        switch (type) {
-            case PacketType::DATA:
-                // Echo the payload back to sender
-                Serial.printf("[SLAVE] DATA from 0x%02X (%d bytes) -> echoing\n", src, len);
-                transport.send(src, PacketType::DATA, data, len);
-                break;
-
-            case PacketType::PING:
-                // Reply with a PONG (transport handles ACK; PING is delivered here)
-                Serial.printf("[SLAVE] PING from 0x%02X -> PONG\n", src);
-                {
-                    // Payload: [my_radio_addr, 0 devices in basic example]
-                    uint8_t pong[2] = {MY_RADIO_ADDR, 0};
-                    transport.send(src, PacketType::PONG, pong, 2);
-                }
-                break;
-
-            default:
-                break;
-        }
-    }
 
     // Periodic status report to Serial
     static uint32_t lastStatMs = 0;

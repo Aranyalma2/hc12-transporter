@@ -67,9 +67,16 @@ bool RadioTransport::begin(HC12Driver* driver, const TransportConfig& cfg) {
     _txSeq = 0;
     _rxQHead = 0;
     _rxQTail = 0;
+    _rxCallback = nullptr;
     _txLastTxMs = 0;
 
     return true;
+}
+
+// --- RX API (Callback) ---
+
+void RadioTransport::onReceive(RadioRxCallback cb) {
+    _rxCallback = cb;
 }
 
 // --- TX API ---
@@ -129,11 +136,13 @@ uint8_t RadioTransport::slavePower(uint8_t slaveAddr) const {
 // --- RX API ---
 
 bool RadioTransport::available() const {
+    if (_rxCallback != nullptr) return false;
     return _rxQHead != _rxQTail;
 }
 
 bool RadioTransport::receive(uint8_t* src, PacketType* type,
                              uint8_t* data, uint8_t* len) {
+    if (_rxCallback != nullptr) return false;
     if (_rxQHead == _rxQTail) return false;
 
     const RadioPacket& pkt = _rxQueue[_rxQTail];
@@ -376,8 +385,10 @@ void RadioTransport::_processComplete() {
 
     _stats.rxPackets++;
 
-    // --- Deliver to application queue ---
-    if (!_rxEnqueue(_rxPacket)) {
+    // --- Deliver to application ---
+    if (_rxCallback) {
+        _rxCallback(_rxPacket.src, _rxPacket.type, _rxPacket.payload, _rxPacket.len);
+    } else if (!_rxEnqueue(_rxPacket)) {
         // Queue full — packet dropped (stats could be added here)
     }
 }

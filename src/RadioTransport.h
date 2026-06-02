@@ -38,6 +38,16 @@
 #include "HC12Driver.h"
 #include "RadioPacket.h"
 
+// --- Types ---
+
+/**
+ * @brief Callback signature for asynchronous packet reception.
+ * If registered, the transport layer will call this directly from update()
+ * instead of queuing the packet.
+ */
+typedef void (*RadioRxCallback)(uint8_t src, PacketType type,
+                                const uint8_t* data, uint8_t len);
+
 // --- Compile-time limits ---
 
 #ifndef HC12_MAX_SLAVES
@@ -152,7 +162,17 @@ class RadioTransport {
     // --- RX API ---
 
     /**
+     * @brief Set a callback for asynchronous packet reception.
+     * If a callback is set, it will be automatically invoked by update() when a
+     * packet arrives. The standard receive queue (available() / receive()) will
+     * be bypassed to prevent mixing paradigms.
+     * @param cb Callback function pointer, or nullptr to disable.
+     */
+    void onReceive(RadioRxCallback cb);
+
+    /**
      * @brief Returns true if at least one received packet is queued.
+     * Note: always returns false if an onReceive() callback is registered.
      */
     bool available() const;
 
@@ -247,6 +267,7 @@ class RadioTransport {
     RadioPacket _rxQueue[HC12_RX_QUEUE_DEPTH];
     uint8_t _rxQHead = 0;
     uint8_t _rxQTail = 0;
+    RadioRxCallback _rxCallback = nullptr;
 
     /** Push a completed packet into the queue. Returns false if full. */
     bool _rxEnqueue(const RadioPacket& pkt);
