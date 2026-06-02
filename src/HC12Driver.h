@@ -10,6 +10,8 @@
  *  - AT command engine: channel, TX power, FU mode, baud rate
  *  - Runtime reconfiguration without power cycling
  *  - Lock-free RX ring buffer (no blocking reads)
+ *  - UART onReceive ISR that pushes bytes into the ring buffer and
+ *    signals the RadioTransport background task via a binary semaphore
  *
  * HC-12 AT command notes:
  *  - SET pin LOW + 40 ms -> enter AT mode (radio deaf during AT mode)
@@ -22,6 +24,8 @@
 
 #include <Arduino.h>
 #include <HardwareSerial.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 #include "RingBuffer.h"
 
@@ -48,9 +52,9 @@ enum class HC12Mode : uint8_t {
  * All fields are applied in order during begin() / configure().
  */
 struct HC12Config {
-    uint8_t channel;  /// RF channel 1–127  (AT+C001 ... AT+C127)
-    uint8_t power;    /// TX power level 1–8 (AT+P1 ... AT+P8, 1=-1dBm, 8=+20dBm)
-    HC12Mode mode;    /// FU1–FU4           (AT+FU1 ... AT+FU4)
+    uint8_t channel;  /// RF channel 1-127  (AT+C001 ... AT+C127)
+    uint8_t power;    /// TX power level 1-8 (AT+P1 ... AT+P8, 1=-1dBm, 8=+20dBm)
+    HC12Mode mode;    /// FU1-FU4           (AT+FU1 ... AT+FU4)
     uint32_t baud;    /// Transparent-mode UART baud (1200/2400/4800/9600/19200/38400/57600/115200)
 };
 
@@ -71,7 +75,8 @@ class HC12Driver {
     /**
      * @brief Initialise the driver.
      *
-     * Configures the SET pin, opens the UART, and applies cfg via AT commands.
+     * Configures the SET pin, opens the UART, applies cfg via AT commands,
+     * creates the RX semaphore, and registers the UART onReceive ISR.
      *
      * @param serial   HardwareSerial instance (e.g. Serial1, Serial2).
      * @param setPin   GPIO connected to HC-12 SET pin.
@@ -95,13 +100,13 @@ class HC12Driver {
 
     /**
      * @brief Change only the RF channel at runtime.
-     * @param ch Channel 1–127.
+     * @param ch Channel 1-127.
      */
     bool setChannel(uint8_t ch);
 
     /**
      * @brief Change only the TX power level at runtime.
-     * @param p Power 1–8 (1 = –1 dBm, 8 = +20 dBm).
+     * @param p Power 1-8 (1 = -1 dBm, 8 = +20 dBm).
      */
     bool setPower(uint8_t p);
 
@@ -136,12 +141,16 @@ class HC12Driver {
      */
     uint16_t read(uint8_t* buf, uint16_t maxLen);
 
+    // --- Event-driven interface ---
+
     /**
-     * @brief Pump bytes from the UART hardware FIFO into the software ring buffer.
-     * Call this as often as possible — typically at the start of your main loop
-     * or in a dedicated FreeRTOS task.
+     * @brief Binary semaphore given by the UART ISR whenever new bytes arrive.
+     *
+     * RadioTransport's background task blocks on this handle so it wakes
+     * immediately on incoming data without polling.
+     * The semaphore is created in begin() and valid for the lifetime of the driver.
      */
-    void update();
+    SemaphoreHandle_t rxSemaphore() const { return _rxNotifySem; }
 
     // --- Diagnostics ---
 
@@ -167,6 +176,15 @@ class HC12Driver {
 
     void flushSerial(uint32_t ms = 10);
 
+    // --- UART ISR ---
+
+    /**
+     * @brief Called from the UART hardware ISR via serial.onReceive().
+     * Drains the UART HW FIFO into _rxBuf and gives _rxNotifySem.
+     * Suppressed during AT command sequences via _atMode flag.
+     */
+    void _onReceiveISR();
+
     // --- Members ---
 
     HardwareSerial* _serial = nullptr;
@@ -177,6 +195,10 @@ class HC12Driver {
     bool _configured = false;
     uint32_t _rxOverflow = 0;
 
-    /** Software RX ring buffer — 512 bytes keeps 2 full max-size frames. */
+    volatile bool _atMode = false;  /// true while AT commands are in progress
+
+    SemaphoreHandle_t _rxNotifySem = nullptr;  /// Binary semaphore given by ISR on new bytes
+
+    /** Software RX ring buffer -- 512 bytes keeps 2 full max-size frames. */
     RingBuffer<512> _rxBuf;
 };

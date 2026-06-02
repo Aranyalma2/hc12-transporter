@@ -6,13 +6,14 @@
  *
  * Sits above HC12Driver and below any application protocol (Modbus, custom, ...).
  * The application supplies raw bytes in send(); the transport frames, CRCs,
- * sequences, ACKs, retries, and delivers clean payloads via receive().
+ * sequences, ACKs, retries, and delivers clean payloads via onReceive() callback
+ * or the receive() queue.
  *
  * --- TX flow ---
- *  IDLE -> SEND -> WAIT_ACK - (ACK) -> IDLE (success)
- *                         -> (timeout) RETRY -> SEND (if retries left)
- *                                         -> FAILED -> IDLE
- *  Broadcast: IDLE -> SEND -> IDLE  (no ACK expected)
+ *  IDLE -> SENDING -> WAIT_ACK - (ACK) -> IDLE (success, unblocks send())
+ *                             -> (timeout) -> SENDING (if retries left)
+ *                                          -> IDLE (failed, unblocks send())
+ *  Broadcast: IDLE -> SENDING -> IDLE  (no ACK expected)
  *
  * --- RX flow ---
  *  Byte-by-byte state machine:
@@ -25,15 +26,19 @@
  *
  * --- Auto-power control ---
  *  Retry-count heuristic per slave:
- *   • too many retries -> increase power (AT+Px)
- *   • zero retries for N consecutive intervals -> decrease power
+ *   too many retries -> increase power (AT+Px)  [applied deferred, TX idle only]
+ *   zero retries for N consecutive intervals -> decrease power
  *
- * --- FreeRTOS ---
- *  Define HC12_USE_RTOS before including this header to enable task spawning.
- *  Without it, call update() from your own loop — fully polling-safe.
+ * --- Background task ---
+ *  Call startTask() once after begin(). The library spawns a FreeRTOS task
+ *  that wakes on UART ISR events and drives both state machines. Never call
+ *  update() -- it no longer exists.
  */
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include <freertos/task.h>
 
 #include "HC12Driver.h"
 #include "RadioPacket.h"
@@ -42,8 +47,13 @@
 
 /**
  * @brief Callback signature for asynchronous packet reception.
- * If registered, the transport layer will call this directly from update()
- * instead of queuing the packet.
+ *
+ * Invoked from the background task when a valid, addressed packet arrives.
+ * It is safe to call sendAsync() from inside this callback.
+ *
+ * @warning Do NOT call send() from inside the callback. send() blocks waiting
+ *          for an ACK that the background task would process -- calling it from
+ *          the callback will deadlock. Use sendAsync() instead.
  */
 typedef void (*RadioRxCallback)(uint8_t src, PacketType type,
                                 const uint8_t* data, uint8_t len);
@@ -65,7 +75,7 @@ typedef void (*RadioRxCallback)(uint8_t src, PacketType type,
  * Pass to RadioTransport::begin().
  */
 struct TransportConfig {
-    uint8_t localAddr;           /// This node's radio address (RADIO_ADDR_MASTER or 0x10–0xFE)
+    uint8_t localAddr;           /// This node's radio address (RADIO_ADDR_MASTER or 0x10-0xFE)
     uint8_t retries;             /// TX retry count per packet (default 3)
     uint16_t ackTimeoutMs;       /// ms to wait for ACK before retry (default 75)
     uint16_t txRxSwitchDelayMs;  /// ms after TX before listening for ACK (default 10)
@@ -73,8 +83,8 @@ struct TransportConfig {
 
     // Auto-power control
     bool autoPowerEnabled;         /// Enable adaptive TX power per slave
-    uint8_t autoPowerMinP;         /// Minimum power level (1–8, default 1)
-    uint8_t autoPowerMaxP;         /// Maximum power level (1–8, default 8)
+    uint8_t autoPowerMinP;         /// Minimum power level (1-8, default 1)
+    uint8_t autoPowerMaxP;         /// Maximum power level (1-8, default 8)
     uint16_t autoPowerIntervalMs;  /// ms between power-adjustment evaluations (default 5000)
     uint8_t autoPowerHighThresh;   /// Retries/interval triggering a power increase (default 2)
     uint8_t autoPowerCleanSteps;   /// Clean intervals before power decrease (default 3)
@@ -124,17 +134,37 @@ class RadioTransport {
     bool begin(HC12Driver* driver,
                const TransportConfig& cfg = TRANSPORT_DEFAULT_CONFIG);
 
+    /**
+     * @brief Spawn the FreeRTOS background task that drives the transport engine.
+     *
+     * Call once from setup() after begin(). After this returns the transport is
+     * fully event-driven. send(), sendAsync(), onReceive(), and receive() are
+     * all thread-safe.
+     *
+     * @param stackDepth  Task stack in words (default 3072).
+     * @param priority    FreeRTOS task priority (default 5, above Arduino loop()).
+     * @param core        CPU core to pin the task to (0 or 1, default 1).
+     * @return true if the task was created successfully.
+     */
+    bool startTask(uint32_t stackDepth = 3072,
+                   UBaseType_t priority = 5,
+                   BaseType_t core = 1);
+
+    /** @brief Stop and delete the background task. Safe to call at any time. */
+    void stopTask();
+
     // --- TX API ---
 
     /**
      * @brief Send a payload to a destination radio address.
      *
-     * For unicast (dest ≠ 0xFF): waits for ACK (blocking). Returns true only
-     * if the remote transport layer acknowledged the packet.
-     * For broadcast (dest == 0xFF): returns true immediately after TX.
+     * For unicast (dest != 0xFF): blocks the calling task until the remote
+     * transport layer acknowledges the packet (or all retries are exhausted).
+     * The CPU is released to other tasks while waiting -- no busy spin.
+     * For broadcast (dest == 0xFF): returns immediately after TX.
      *
-     * Internally calls update() in a spin loop while waiting for ACK —
-     * safe to call from a single task / main loop.
+     * @warning Do NOT call send() from inside an onReceive() callback.
+     *          Use sendAsync() instead to avoid deadlock.
      *
      * @param dest   Destination radio address.
      * @param type   Packet type (use PacketType::DATA for application data).
@@ -146,9 +176,12 @@ class RadioTransport {
               const uint8_t* data, uint8_t len);
 
     /**
-     * @brief Non-blocking send — kicks off TX, returns immediately.
-     * Call isBusy() / poll update() to track completion.
-     * Prefer send() for simple use-cases.
+     * @brief Non-blocking send -- queues the packet and returns immediately.
+     *
+     * Safe to call from inside an onReceive() callback.
+     * Call isBusy() to check whether the previous async TX completed.
+     *
+     * @return true if the packet was queued; false if a TX is already in progress.
      */
     bool sendAsync(uint8_t dest, PacketType type,
                    const uint8_t* data, uint8_t len);
@@ -163,9 +196,13 @@ class RadioTransport {
 
     /**
      * @brief Set a callback for asynchronous packet reception.
-     * If a callback is set, it will be automatically invoked by update() when a
-     * packet arrives. The standard receive queue (available() / receive()) will
-     * be bypassed to prevent mixing paradigms.
+     *
+     * The callback fires from the background task on every valid incoming packet.
+     * It is safe to call sendAsync() from within the callback.
+     *
+     * @warning Do NOT call send() from inside the callback -- deadlock will occur.
+     *          Use sendAsync() instead.
+     *
      * @param cb Callback function pointer, or nullptr to disable.
      */
     void onReceive(RadioRxCallback cb);
@@ -179,30 +216,23 @@ class RadioTransport {
     /**
      * @brief Pop the oldest received packet.
      *
+     * Thread-safe. May be called from loop() concurrently with the background task.
+     *
      * @param[out] src   Radio address of the sender.
      * @param[out] type  Packet type.
-     * @param[out] data  Payload bytes (caller must provide ≥ RADIO_MAX_PAYLOAD bytes).
+     * @param[out] data  Payload bytes (caller must provide >= RADIO_MAX_PAYLOAD bytes).
      * @param[out] len   Payload length.
      * @return true if a packet was available and copied.
      */
     bool receive(uint8_t* src, PacketType* type,
                  uint8_t* data, uint8_t* len);
 
-    // --- Engine ---
-
-    /**
-     * @brief Drive the TX and RX state machines.
-     * Must be called frequently (every few ms).
-     * In polling mode, call from loop(). In RTOS mode, call from a task.
-     */
-    void update();
-
     // --- Auto-power ---
 
     /**
-     * @brief Evaluate and optionally adjust TX power for one slave.
-     * Called automatically by update() when autoPowerEnabled = true.
-     * Can also be called manually at any time.
+     * @brief Evaluate and optionally schedule a TX power adjustment for one slave.
+     * Called automatically by the background task when autoPowerEnabled = true.
+     * Power changes are deferred and applied only when the TX machine is idle.
      */
     void runAutoPower(uint8_t slaveAddr);
 
@@ -211,7 +241,7 @@ class RadioTransport {
     const LinkStats& stats() const { return _stats; }
     void resetStats() { memset(&_stats, 0, sizeof(_stats)); }
 
-    /** @brief Current TX power level (1–8) used for the given slave. */
+    /** @brief Current TX power level (1-8) used for the given slave. */
     uint8_t slavePower(uint8_t slaveAddr) const;
 
    private:
@@ -221,13 +251,17 @@ class RadioTransport {
         IDLE,
         SENDING,
         WAIT_ACK,
-        SUCCESS,
+        SUCCESS,  // kept for state completeness; resolved inline in _processComplete()
         RETRY,
-        FAILED,
+        FAILED,  // kept for state completeness; resolved inline in _processComplete()
     };
 
     void _updateTx();
     void _doSend(const RadioPacket& pkt);
+
+    /** @brief Inner sendAsync logic, called with _txMutex already held. */
+    bool _sendAsyncInternal(uint8_t dest, PacketType type,
+                            const uint8_t* data, uint8_t len);
 
     // --- RX state machine ---
 
@@ -246,6 +280,10 @@ class RadioTransport {
     void _updateRx();
     void _processComplete();
     void _sendAck(uint8_t dest, uint8_t seq, bool ack);
+
+    // --- Background task ---
+
+    static void _taskFunc(void* arg);
 
     // --- TX state ---
     TxState _txState = TxState::IDLE;
@@ -274,7 +312,7 @@ class RadioTransport {
 
     // --- Duplicate detection ---
     uint8_t _lastSeq[256];  /// Last seen SEQ per source address
-    bool _seqSeen[256];     /// Whether we've received anything from this src
+    bool _seqSeen[256];     /// Whether we have received anything from this src
 
     // --- Per-slave auto-power state ---
     struct SlaveState {
@@ -288,6 +326,15 @@ class RadioTransport {
     SlaveState _slaves[HC12_MAX_SLAVES];
 
     SlaveState* _findOrAllocSlave(uint8_t addr);
+
+    // --- FreeRTOS handles ---
+    TaskHandle_t _taskHandle = nullptr;
+    SemaphoreHandle_t _txMutex = nullptr;    /// Protects TX state machine
+    SemaphoreHandle_t _rxMutex = nullptr;    /// Protects _rxQueue head/tail
+    SemaphoreHandle_t _ackEvent = nullptr;   /// Given when ACK/NACK resolves send()
+    SemaphoreHandle_t _txTrigger = nullptr;  /// Given by sendAsync() to wake task
+
+    uint8_t _pendingPower = 0;  /// Deferred setPower() target (0 = no change pending)
 
     // --- Dependencies and config ---
     HC12Driver* _driver = nullptr;

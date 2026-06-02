@@ -32,6 +32,15 @@ bool HC12Driver::begin(HardwareSerial* serial, uint8_t setPin,
     delay(100);  // let module power up
 
     _configured = configure(cfg);
+
+    // Create the binary semaphore the background task blocks on.
+    // Do this after configure() so the ISR is not registered during AT mode.
+    _rxNotifySem = xSemaphoreCreateBinary();
+
+    // Register the UART onReceive ISR.
+    // From this point every byte arriving at the UART HW FIFO wakes the task.
+    _serial->onReceive([this]() { _onReceiveISR(); });
+
     return _configured;
 }
 
@@ -48,7 +57,6 @@ bool HC12Driver::configure(const HC12Config& cfg) {
     ok &= sendAT(cmd, "OK+FU");
 
     // 2. UART baud
-    // Valid HC-12 baud rates (AT+Bxxxxx)
     snprintf(cmd, sizeof(cmd), "AT+B%lu", (unsigned long)cfg.baud);
     ok &= sendAT(cmd, "OK+B");
 
@@ -64,7 +72,6 @@ bool HC12Driver::configure(const HC12Config& cfg) {
 
     if (ok) {
         _config = cfg;
-        // Reopen serial at new baud after exit (HC-12 now uses cfg.baud)
         _serial->flush();
         if (_rxPin >= 0 && _txPin >= 0) {
             _serial->begin(cfg.baud, SERIAL_8N1, _rxPin, _txPin);
@@ -132,19 +139,33 @@ uint16_t HC12Driver::read(uint8_t* buf, uint16_t maxLen) {
     return _rxBuf.read(buf, maxLen);
 }
 
-void HC12Driver::update() {
+// --- UART ISR ---
+
+void HC12Driver::_onReceiveISR() {
+    // During AT command sequences the AT engine reads the UART directly.
+    // Suppress the ISR pump to avoid consuming those bytes.
+    if (_atMode) return;
+
+    // Drain the UART HW FIFO into the software ring buffer.
+    // RingBuffer<> is single-producer / single-consumer safe:
+    // the ISR writes _head only; the background task reads _tail only.
     while (_serial && _serial->available()) {
         uint8_t b = (uint8_t)_serial->read();
-        if (!_rxBuf.push(b)) {
-            _rxOverflow++;
-        }
+        if (!_rxBuf.push(b)) _rxOverflow++;
     }
+
+    // Wake the RadioTransport background task.
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(_rxNotifySem, &woken);
+    portYIELD_FROM_ISR(woken);
 }
 
 // --- AT command engine (private) ---
 
 bool HC12Driver::enterAT() {
     if (!_serial) return false;
+
+    _atMode = true;  // suppress ISR byte-pumping during AT mode
 
     // Assert SET LOW -> enter AT mode
     digitalWrite(_setPin, LOW);
@@ -158,14 +179,14 @@ bool HC12Driver::enterAT() {
         } else {
             _serial->begin(bauds[i], SERIAL_8N1);
         }
-        delay(20);  // wait for UART to stabilize and TX to idle high
+        delay(20);  // wait for UART to stabilize
 
-        // Verify module is alive - try twice to clear potential line level glitches
         if (sendAT("AT", "OK") || sendAT("AT", "OK")) {
             return true;
         }
     }
 
+    _atMode = false;  // restore if we failed to enter AT mode
     return false;
 }
 
@@ -175,7 +196,7 @@ bool HC12Driver::exitAT() {
     delay(HC12_AT_EXIT_MS);
     flushSerial(20);
 
-    // Restore transparent baud (may have changed during configure())
+    // Restore transparent baud
     _serial->flush();
     if (_rxPin >= 0 && _txPin >= 0) {
         _serial->begin(_config.baud, SERIAL_8N1, _rxPin, _txPin);
@@ -183,21 +204,19 @@ bool HC12Driver::exitAT() {
         _serial->begin(_config.baud, SERIAL_8N1);
     }
 
+    _atMode = false;  // re-enable ISR byte-pumping
     return true;
 }
 
 bool HC12Driver::sendAT(const char* cmd, const char* expect) {
     if (!_serial) return false;
 
-    // Flush any pending RX garbage
     flushSerial(10);
 
-    // Send command with CR LF
     _serial->print(cmd);
     _serial->print(F("\r\n"));
     _serial->flush();
 
-    // Read response, look for expect token
     char resp[64];
     uint8_t idx = 0;
     uint32_t t0 = millis();
@@ -209,7 +228,6 @@ bool HC12Driver::sendAT(const char* cmd, const char* expect) {
                 resp[idx++] = c;
                 resp[idx] = '\0';
             }
-            // Check for expected token after each character
             if (strstr(resp, expect) != nullptr) {
                 return true;
             }

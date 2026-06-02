@@ -1,5 +1,5 @@
 /**
- * master_debug.ino — HC-12 Radio Network Diagnostic Tool
+ * master_debug.ino -- HC-12 Radio Network Diagnostic Tool
  *
  * Every 5 seconds this master:
  *  1. Sends a PKT_PING to each configured slave
@@ -7,7 +7,13 @@
  *  3. Tracks per-slave retries, success rate, and current TX power level
  *  4. Prints a formatted diagnostic table to the Serial Monitor
  *
- * Slaves must run slave_basic.ino — they echo PKT_PONG on every PKT_PING.
+ * Event-driven model:
+ *  - transport.startTask() spawns the FreeRTOS background task in setup()
+ *  - update() no longer exists and must not be called
+ *  - probeSlave() sends the PING (blocking via semaphore), then waits for
+ *    the PONG via a short vTaskDelay + receive() drain instead of spinning
+ *
+ * Slaves must run slave_basic.ino -- they reply with PKT_PONG on every PKT_PING.
  *
  * HC-12 does NOT expose an RSSI register, so link quality is estimated from
  * the retry-count heuristic used by the auto-power controller:
@@ -22,9 +28,9 @@
  *   P5 = 11 dBm  |  P6 = 14  |  P7 = 17  |  P8 = 20 dBm
  *
  * Wiring:
- *   ESP32 GPIO17 (TX1) -> HC-12 RX
- *   ESP32 GPIO16 (RX1) -> HC-12 TX
- *   ESP32 GPIO4        -> HC-12 SET
+ *   ESP32 GPIO33 (TX1) -> HC-12 RX
+ *   ESP32 GPIO32 (RX1) -> HC-12 TX
+ *   ESP32 GPIO12       -> HC-12 SET
  *
  * ANSI colour codes are emitted by default. In Arduino IDE 2.x Serial Monitor
  * set "Carriage Return + Line Feed" and the colours will render.
@@ -48,7 +54,7 @@ static constexpr uint8_t HC12_TX_PIN = 33;
 static constexpr uint32_t REPORT_INTERVAL_MS = 5000;  ///< Diagnostic print interval
 static constexpr uint32_t PONG_WAIT_MS = 350;         ///< Max wait for PONG after PING ACK
 
-// Max retries — must match slave TransportConfig
+// Max retries -- must match slave TransportConfig
 static constexpr uint8_t MAX_RETRIES = 3;
 
 // --- ANSI colour helpers ---
@@ -75,10 +81,10 @@ static constexpr uint8_t MAX_RETRIES = 3;
 
 // --- Power level lookup table ---
 
-/** HC-12 P1–P8 in dBm (index 0 unused). */
+/** HC-12 P1-P8 in dBm (index 0 unused). */
 static const int8_t POWER_DBM[9] = {0, -1, 2, 5, 8, 11, 14, 17, 20};
 
-/** Bar representation of power P1–P8 (8 chars wide). */
+/** Bar representation of power P1-P8 (8 chars wide). */
 static const char* POWER_BAR[9] = {
     "",
     "[=       ]",  // P1
@@ -113,8 +119,8 @@ struct SlaveRecord {
     uint32_t retriesTotal;      ///< All-time retries to this slave
 
     // Link quality
-    uint8_t linkQuality;  ///< 0–100 estimate
-    uint8_t powerLevel;   ///< Current auto-power level for this slave (1–8)
+    uint8_t linkQuality;  ///< 0-100 estimate
+    uint8_t powerLevel;   ///< Current auto-power level for this slave (1-8)
 
     // Interval snapshot for delta stats
     uint32_t prevPingsSent;
@@ -149,7 +155,6 @@ static void printUptime() {
 static uint8_t estimateQuality(uint8_t retries, bool ok) {
     if (!ok) return 0;
     if (retries == 0) return 100;
-    // Linearly scale: 0 retries = 100%, MAX_RETRIES = 25% (still passed)
     int q = 100 - (int)retries * 75 / MAX_RETRIES;
     return (q < 0) ? 0 : (uint8_t)q;
 }
@@ -177,11 +182,9 @@ static void probeSlave(SlaveRecord& r) {
     // Snapshot global retry counter to compute per-ping retries
     uint32_t retriesBefore = transport.stats().retries;
 
-    // --- TX PING (blocking: waits for transport-level ACK) ---
+    // --- TX PING (blocking: send() waits via semaphore for transport-level ACK) ---
     uint32_t t0 = millis();
     bool ackOk = transport.send(r.addr, PacketType::PING, nullptr, 0);
-    uint32_t tAck = millis();  // time we got transport ACK (or gave up)
-    (void)tAck;
 
     r.retriesThisCycle = transport.stats().retries - retriesBefore;
     r.retriesTotal += r.retriesThisCycle;
@@ -195,31 +198,31 @@ static void probeSlave(SlaveRecord& r) {
     }
 
     // --- Wait for application-level PONG from the slave ---
-    // slave_basic.ino sends PacketType::PONG after receiving the PING.
-    uint32_t deadline = millis() + PONG_WAIT_MS;
+    // Poll the RX queue in 1 ms slices so we break out the instant the PONG
+    // arrives, giving an accurate RTT reading. vTaskDelay(1) yields the CPU
+    // to the background task on every iteration -- no busy-spin.
     bool pongReceived = false;
-
-    while (millis() < deadline) {
-        transport.update();
-
+    {
+        uint32_t deadline = millis() + PONG_WAIT_MS;
         uint8_t src;
         PacketType type;
         uint8_t data[RADIO_MAX_PAYLOAD];
         uint8_t len;
 
-        while (transport.receive(&src, &type, data, &len)) {
-            if (src == r.addr && type == PacketType::PONG) {
-                pongReceived = true;
-                break;
+        while (millis() < deadline && !pongReceived) {
+            while (transport.receive(&src, &type, data, &len)) {
+                if (src == r.addr && type == PacketType::PONG) {
+                    pongReceived = true;
+                    break;
+                }
+                // Discard unexpected packets that arrived during the wait window
             }
-            // Silently discard unexpected packets during probe window
+            if (!pongReceived) vTaskDelay(pdMS_TO_TICKS(1));  // yield, check again next ms
         }
-        if (pongReceived) break;
     }
 
     uint32_t rtt = millis() - t0;
 
-    // Update record
     r.online = pongReceived;
     r.rttLastMs = pongReceived ? rtt : 0;
     r.linkQuality = estimateQuality((uint8_t)r.retriesThisCycle, pongReceived);
@@ -228,12 +231,10 @@ static void probeSlave(SlaveRecord& r) {
         r.everSeen = true;
         r.pongsReceived++;
 
-        // Rolling min/max/avg (all-time)
         if (r.rttMinMs == 0 || rtt < r.rttMinMs) r.rttMinMs = rtt;
         if (rtt > r.rttMaxMs) r.rttMaxMs = rtt;
         r.rttSumMs += rtt;
 
-        // Interval stats (reset each report)
         r.rttSumInterval += rtt;
         r.rttCountInterval++;
     }
@@ -245,7 +246,6 @@ static void printReport() {
     const LinkStats& st = transport.stats();
     const HC12Config& hcfg = radio.getConfig();
 
-    // --- Delta stats since last report ---
     uint32_t dTx = st.txPackets - prevStats.txPackets;
     uint32_t dRx = st.rxPackets - prevStats.rxPackets;
     uint32_t dCrc = st.crcErrors - prevStats.crcErrors;
@@ -253,22 +253,20 @@ static void printReport() {
     uint32_t dTimeouts = st.timeouts - prevStats.timeouts;
     uint32_t dFailed = st.txFailed - prevStats.txFailed;
     prevStats = st;
+    (void)dFailed;
 
-    // Simple header
     Serial.println();
     Serial.print(ANSI_BOLD ANSI_CYAN);
     Serial.print(F("HC-12 Diagnostics  "));
     printUptime();
     Serial.println(ANSI_RESET);
 
-    // Module summary
     Serial.print(ANSI_DIM);
     Serial.printf("  CH=%03d FU%d %lu baud  Global: P%d (%+d dBm)  Slaves=%d\r\n",
                   hcfg.channel, (int)hcfg.mode, (unsigned long)hcfg.baud,
                   hcfg.power, POWER_DBM[hcfg.power], SLAVE_COUNT);
     Serial.print(ANSI_RESET);
 
-    // Per-slave lines
     for (uint8_t i = 0; i < SLAVE_COUNT; i++) {
         SlaveRecord& r = records[i];
 
@@ -304,12 +302,9 @@ static void printReport() {
                       (unsigned long)MAX_RETRIES);
 
         Serial.printf("P%d (%+d dBm) %s%s" ANSI_RESET "\r\n",
-                      p, POWER_DBM[p],
-                      qColor,
-                      POWER_BAR[p]);
+                      p, POWER_DBM[p], qColor, POWER_BAR[p]);
     }
 
-    // Transport summary (delta + total)
     Serial.print(ANSI_DIM);
     Serial.printf("  TX +%lu/%lu  RX +%lu/%lu  CRC +%lu/%lu  Retries +%lu/%lu  Timeouts +%lu/%lu\r\n",
                   (unsigned long)dTx, (unsigned long)st.txPackets,
@@ -319,7 +314,6 @@ static void printReport() {
                   (unsigned long)dTimeouts, (unsigned long)st.timeouts);
     Serial.print(ANSI_RESET);
 
-    // Reset interval accumulators
     for (uint8_t i = 0; i < SLAVE_COUNT; i++) {
         records[i].rttSumInterval = 0;
         records[i].rttCountInterval = 0;
@@ -335,11 +329,10 @@ void setup() {
     pinMode(35, INPUT);
 
     Serial.println(ANSI_BOLD ANSI_CYAN
-                   "\n  HC-12 Radio Network Diagnostic — master_debug.ino" ANSI_RESET);
+                   "\n  HC-12 Radio Network Diagnostic -- master_debug.ino" ANSI_RESET);
     Serial.println(ANSI_DIM
                    "  Slaves must run slave_basic.ino on the same channel/mode" ANSI_RESET "\n");
 
-    // Zero-initialise records
     for (uint8_t i = 0; i < SLAVE_COUNT; i++) {
         records[i] = {};
         records[i].addr = SLAVE_ADDRS[i];
@@ -347,8 +340,8 @@ void setup() {
 
     // --- HC-12 configuration ---
     HC12Config hcCfg;
-    hcCfg.channel = 5;  // RF channel (1–127)
-    hcCfg.power = 8;    // Initial TX power 1–8 (auto-power may reduce)
+    hcCfg.channel = 5;
+    hcCfg.power = 8;
     hcCfg.mode = HC12Mode::FU3;
     hcCfg.baud = 19200;
 
@@ -358,27 +351,32 @@ void setup() {
 
     if (!radio.begin(&Serial1, HC12_SET_PIN, HC12_RX_PIN, HC12_TX_PIN, hcCfg)) {
         Serial.println(ANSI_RED
-                       "  HC-12 init FAILED — check wiring and SET pin" ANSI_RESET);
+                       "  HC-12 init FAILED -- check wiring and SET pin" ANSI_RESET);
         while (true) delay(1000);
     }
     Serial.println(ANSI_GREEN "  HC-12 OK" ANSI_RESET);
 
     // --- Transport configuration ---
     TransportConfig tCfg = TRANSPORT_DEFAULT_CONFIG;
-    tCfg.localAddr = RADIO_ADDR_MASTER;  // 0x01
+    tCfg.localAddr = RADIO_ADDR_MASTER;
     tCfg.retries = MAX_RETRIES;
     tCfg.ackTimeoutMs = 75;
-    tCfg.autoPowerEnabled = true;  // adaptive TX power per slave
+    tCfg.autoPowerEnabled = true;
     tCfg.autoPowerMinP = 1;
     tCfg.autoPowerMaxP = 8;
-    tCfg.autoPowerIntervalMs = REPORT_INTERVAL_MS;  // sync with report cycle
-    tCfg.autoPowerHighThresh = 1;                   // increase power after just 1 retry
-    tCfg.autoPowerCleanSteps = 4;                   // decrease after 4 clean intervals
+    tCfg.autoPowerIntervalMs = REPORT_INTERVAL_MS;
+    tCfg.autoPowerHighThresh = 1;
+    tCfg.autoPowerCleanSteps = 4;
 
     transport.begin(&radio, tCfg);
+
+    // Spawn the background task. No update() call is needed anywhere after this.
+    if (!transport.startTask()) {
+        Serial.println(ANSI_RED "  startTask FAILED" ANSI_RESET);
+        while (true) delay(1000);
+    }
     Serial.println(ANSI_GREEN "  Transport OK" ANSI_RESET);
 
-    // Print slave list
     Serial.printf("  Monitoring %d slave(s): ", SLAVE_COUNT);
     for (uint8_t i = 0; i < SLAVE_COUNT; i++) {
         Serial.printf("0x%02X ", SLAVE_ADDRS[i]);
@@ -390,21 +388,17 @@ void setup() {
 // --- loop() ---
 
 void loop() {
-    transport.update();
-
     static uint32_t lastReportMs = 0;
 
     if (millis() - lastReportMs >= REPORT_INTERVAL_MS) {
         lastReportMs = millis();
 
-        // Probe each slave in sequence
         for (uint8_t i = 0; i < SLAVE_COUNT; i++) {
             probeSlave(records[i]);
             // Brief pause between probes to avoid collisions on the RF medium
-            delay(30);
+            vTaskDelay(pdMS_TO_TICKS(30));
         }
 
-        // Print the diagnostic table
         printReport();
     }
 

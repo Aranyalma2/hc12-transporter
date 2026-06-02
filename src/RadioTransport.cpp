@@ -1,6 +1,20 @@
 /**
  * @file RadioTransport.cpp
- * @brief RadioTransport — TX/RX state machines, ACK/retry, auto-power.
+ * @brief RadioTransport -- TX/RX state machines, ACK/retry, auto-power.
+ *
+ * All state machine work runs inside the FreeRTOS background task spawned by
+ * startTask(). The public API (send, sendAsync, receive) is thread-safe.
+ *
+ * Mutex strategy:
+ *  _txMutex  -- protects _txState and all TX state variables.
+ *               Held by _updateTx() and briefly by sendAsync() / _processComplete().
+ *               Released around vTaskDelay() in the SENDING case so sendAsync()
+ *               callers are not blocked for the full txRxSwitchDelayMs window.
+ *  _rxMutex  -- protects _rxQueue head/tail, taken briefly in _rxEnqueue() / receive().
+ *  _ackEvent -- binary semaphore given when a unicast TX resolves (ACK, NACK, timeout).
+ *               send() blocks on this; never held across any blocking call.
+ *  _txTrigger-- binary semaphore given by sendAsync() to wake the task immediately
+ *               instead of waiting for the 5 ms heartbeat tick.
  */
 
 #include "RadioTransport.h"
@@ -33,9 +47,9 @@ bool RadioPacket::decode(const uint8_t* buf, uint8_t frameLen) {
     if (plen > RADIO_MAX_PAYLOAD) return false;
     if (frameLen != (uint8_t)(RADIO_HEADER_SIZE + plen + RADIO_CRC_SIZE)) return false;
 
-    // Verify CRC
     uint16_t crcCalc = crc16_ccitt(buf + 1, (uint16_t)(5u + plen));
-    uint16_t crcRecv = (uint16_t)buf[RADIO_HEADER_SIZE + plen] | ((uint16_t)buf[RADIO_HEADER_SIZE + plen + 1] << 8u);
+    uint16_t crcRecv = (uint16_t)buf[RADIO_HEADER_SIZE + plen] |
+                       ((uint16_t)buf[RADIO_HEADER_SIZE + plen + 1] << 8u);
     if (crcCalc != crcRecv) return false;
 
     dest = buf[1];
@@ -69,14 +83,84 @@ bool RadioTransport::begin(HC12Driver* driver, const TransportConfig& cfg) {
     _rxQTail = 0;
     _rxCallback = nullptr;
     _txLastTxMs = 0;
+    _pendingPower = 0;
 
     return true;
 }
 
-// --- RX API (Callback) ---
+// --- Background task ---
+
+bool RadioTransport::startTask(uint32_t stackDepth, UBaseType_t priority, BaseType_t core) {
+    if (_taskHandle) return true;  // already running
+
+    _txMutex = xSemaphoreCreateMutex();
+    _rxMutex = xSemaphoreCreateMutex();
+    _ackEvent = xSemaphoreCreateBinary();
+    _txTrigger = xSemaphoreCreateBinary();
+
+    if (!_txMutex || !_rxMutex || !_ackEvent || !_txTrigger) return false;
+
+    return xTaskCreatePinnedToCore(
+               _taskFunc, "hc12_transport",
+               stackDepth, this, priority, &_taskHandle, core) == pdPASS;
+}
+
+void RadioTransport::stopTask() {
+    if (_taskHandle) {
+        vTaskDelete(_taskHandle);
+        _taskHandle = nullptr;
+    }
+}
+
+void RadioTransport::_taskFunc(void* arg) {
+    RadioTransport* self = static_cast<RadioTransport*>(arg);
+    SemaphoreHandle_t rxSem = self->_driver->rxSemaphore();
+
+    for (;;) {
+        // Block until the UART ISR gives rxSem (new bytes arrived) or 5 ms elapse.
+        // The 5 ms timeout is the TX-timeout heartbeat: _updateTx() needs to run
+        // often enough to detect ACK timeouts even when no bytes are arriving.
+        xSemaphoreTake(rxSem, pdMS_TO_TICKS(5));
+        xSemaphoreTake(self->_txTrigger, 0);  // drain without blocking
+
+        // _updateRx does not hold _txMutex.
+        // _sendAck() inside _processComplete() is a direct _driver->send() call
+        // that bypasses the mutex entirely -- safe from any context.
+        self->_updateRx();
+        self->_updateTx();
+    }
+}
+
+// --- RX API ---
 
 void RadioTransport::onReceive(RadioRxCallback cb) {
     _rxCallback = cb;
+}
+
+bool RadioTransport::available() const {
+    if (_rxCallback != nullptr) return false;
+    return _rxQHead != _rxQTail;
+}
+
+bool RadioTransport::receive(uint8_t* src, PacketType* type,
+                             uint8_t* data, uint8_t* len) {
+    if (_rxCallback != nullptr) return false;
+
+    // Brief lock: protect _rxQHead / _rxQTail from concurrent _rxEnqueue().
+    if (xSemaphoreTake(_rxMutex, pdMS_TO_TICKS(5)) != pdTRUE) return false;
+
+    bool ok = (_rxQHead != _rxQTail);
+    if (ok) {
+        const RadioPacket& pkt = _rxQueue[_rxQTail];
+        if (src) *src = pkt.src;
+        if (type) *type = pkt.type;
+        if (len) *len = pkt.len;
+        if (data && pkt.len > 0) memcpy(data, pkt.payload, pkt.len);
+        _rxQTail = (_rxQTail + 1u) % HC12_RX_QUEUE_DEPTH;
+    }
+
+    xSemaphoreGive(_rxMutex);
+    return ok;
 }
 
 // --- TX API ---
@@ -85,23 +169,31 @@ bool RadioTransport::send(uint8_t dest, PacketType type,
                           const uint8_t* data, uint8_t len) {
     if (!sendAsync(dest, type, data, len)) return false;
 
-    // Spin until done (blocking)
-    uint32_t startMs = millis();
+    // Broadcast: no ACK expected, already done after UART write.
+    if (dest == RADIO_ADDR_BROADCAST) return true;
+
+    // Block the calling task until the background task resolves the ACK.
+    // The CPU is fully released to other tasks while waiting.
     uint32_t timeoutMs = (uint32_t)_cfg.ackTimeoutMs * (_cfg.retries + 1u) + 200u;
-
-    while (millis() - startMs < timeoutMs) {
-        update();
-        if (!isBusy()) return _txLastResult;
-    }
-
-    // Timeout fallback
-    _txState = TxState::IDLE;
-    _txLastResult = false;
-    return false;
+    xSemaphoreTake(_ackEvent, pdMS_TO_TICKS(timeoutMs));
+    return _txLastResult;
 }
 
 bool RadioTransport::sendAsync(uint8_t dest, PacketType type,
                                const uint8_t* data, uint8_t len) {
+    if (xSemaphoreTake(_txMutex, pdMS_TO_TICKS(10)) != pdTRUE) return false;
+    bool ok = _sendAsyncInternal(dest, type, data, len);
+    xSemaphoreGive(_txMutex);
+
+    // Wake the background task immediately so TX starts without waiting
+    // for the next 5 ms heartbeat tick.
+    if (ok) xSemaphoreGive(_txTrigger);
+    return ok;
+}
+
+bool RadioTransport::_sendAsyncInternal(uint8_t dest, PacketType type,
+                                        const uint8_t* data, uint8_t len) {
+    // Caller must hold _txMutex.
     if (_txState != TxState::IDLE) return false;  // busy
 
     uint8_t plen = (len > RADIO_MAX_PAYLOAD) ? RADIO_MAX_PAYLOAD : len;
@@ -133,39 +225,22 @@ uint8_t RadioTransport::slavePower(uint8_t slaveAddr) const {
     return _cfg.autoPowerMaxP;
 }
 
-// --- RX API ---
-
-bool RadioTransport::available() const {
-    if (_rxCallback != nullptr) return false;
-    return _rxQHead != _rxQTail;
-}
-
-bool RadioTransport::receive(uint8_t* src, PacketType* type,
-                             uint8_t* data, uint8_t* len) {
-    if (_rxCallback != nullptr) return false;
-    if (_rxQHead == _rxQTail) return false;
-
-    const RadioPacket& pkt = _rxQueue[_rxQTail];
-    if (src) *src = pkt.src;
-    if (type) *type = pkt.type;
-    if (len) *len = pkt.len;
-    if (data && pkt.len > 0) memcpy(data, pkt.payload, pkt.len);
-
-    _rxQTail = (_rxQTail + 1u) % HC12_RX_QUEUE_DEPTH;
-    return true;
-}
-
-// --- Main engine ---
-
-void RadioTransport::update() {
-    if (_driver) _driver->update();  // pump UART bytes into ring buffer
-    _updateRx();
-    _updateTx();
-}
-
 // --- TX state machine ---
 
 void RadioTransport::_updateTx() {
+    xSemaphoreTake(_txMutex, portMAX_DELAY);
+
+    // Apply a deferred power change only when the TX machine is fully idle.
+    // setPower() enters AT mode for ~150 ms; we release the mutex around it
+    // so sendAsync() callers are not blocked for that duration.
+    if (_pendingPower != 0 && _txState == TxState::IDLE) {
+        uint8_t p = _pendingPower;
+        _pendingPower = 0;
+        xSemaphoreGive(_txMutex);
+        _driver->setPower(p);
+        xSemaphoreTake(_txMutex, portMAX_DELAY);
+    }
+
     switch (_txState) {
         case TxState::IDLE:
             break;
@@ -177,18 +252,24 @@ void RadioTransport::_updateTx() {
                 break;  // wait
             }
 
-            _doSend(_txPacket);
-            _txSentMs = millis();
-            _txLastTxMs = _txSentMs;
             _stats.retries += (_txRetriesLeft < _cfg.retries) ? 1u : 0u;
+            _doSend(_txPacket);  // encode + UART write only, no blocking delay
 
             if (_txBroadcast) {
-                // Broadcast: no ACK, done
+                _txLastTxMs = millis();
                 _txLastResult = true;
                 _txState = TxState::IDLE;
                 _stats.broadcasts++;
             } else {
+                // Release mutex while giving HC-12 time to switch from TX to RX mode.
+                // _txState is WAIT_ACK so sendAsync() callers will see busy and return
+                // false immediately after taking the mutex.
                 _txState = TxState::WAIT_ACK;
+                xSemaphoreGive(_txMutex);
+                vTaskDelay(pdMS_TO_TICKS(_cfg.txRxSwitchDelayMs));
+                xSemaphoreTake(_txMutex, portMAX_DELAY);
+                _txSentMs = millis();
+                _txLastTxMs = _txSentMs;
             }
             break;
         }
@@ -198,32 +279,31 @@ void RadioTransport::_updateTx() {
                 _stats.timeouts++;
                 if (_txRetriesLeft > 0) {
                     _txRetriesLeft--;
-                    // Track for auto-power
                     SlaveState* s = _findOrAllocSlave(_txPacket.dest);
                     if (s) s->retryAccum++;
                     _txState = TxState::SENDING;
                 } else {
-                    _txState = TxState::FAILED;
+                    // All retries exhausted -- fail and unblock send().
+                    _txLastResult = false;
+                    _txState = TxState::IDLE;
                     _stats.txFailed++;
+                    xSemaphoreGive(_txMutex);
+                    xSemaphoreGive(_ackEvent);
+                    return;  // mutex already released
                 }
             }
             break;
 
-        case TxState::SUCCESS:
+        case TxState::SUCCESS:  // resolved inline in _processComplete(); not reached
             _txLastResult = true;
             _txState = TxState::IDLE;
-            _stats.txPackets++;
-            if (_cfg.autoPowerEnabled && !_txBroadcast) {
-                _findOrAllocSlave(_txPacket.dest);
-            }
             break;
 
-        case TxState::RETRY:
-            // Should not reach here directly; handled in WAIT_ACK
+        case TxState::RETRY:  // legacy; not reached in event-driven mode
             _txState = TxState::SENDING;
             break;
 
-        case TxState::FAILED:
+        case TxState::FAILED:  // resolved inline in _processComplete(); not reached
             _txLastResult = false;
             _txState = TxState::IDLE;
             break;
@@ -240,18 +320,25 @@ void RadioTransport::_updateTx() {
             }
         }
     }
+
+    xSemaphoreGive(_txMutex);
 }
 
 void RadioTransport::_doSend(const RadioPacket& pkt) {
+    // Encode the packet and push it to the UART TX FIFO.
+    // The txRxSwitchDelayMs pause after this call is handled by _updateTx()
+    // with the mutex released so other tasks are not blocked during the wait.
     uint8_t buf[RADIO_MAX_FRAME];
     uint8_t n = pkt.encode(buf);
     _driver->send(buf, n);
-    delay(_cfg.txRxSwitchDelayMs);  // give HC-12 time to switch RX
 }
 
 // --- RX state machine ---
 
 void RadioTransport::_updateRx() {
+    // No mutex held here -- _rxBuf is single-producer (ISR) / single-consumer
+    // (this task) safe. _processComplete() takes _txMutex briefly only for the
+    // ACK/NACK branch; _sendAck() bypasses the mutex entirely.
     while (_driver->available()) {
         uint8_t b;
         _driver->read(&b, 1);
@@ -285,16 +372,12 @@ void RadioTransport::_updateRx() {
 
             case RxState::RD_LEN:
                 if (b > RADIO_MAX_PAYLOAD) {
-                    // Invalid length — discard and resync
+                    // Invalid length -- discard and resync
                     _rxState = RxState::WAIT_SOF;
                 } else {
                     _rxPacket.len = b;
                     _rxPayloadIdx = 0;
-                    if (b == 0) {
-                        _rxState = RxState::RD_CRC1;
-                    } else {
-                        _rxState = RxState::RD_PAYLOAD;
-                    }
+                    _rxState = (b == 0) ? RxState::RD_CRC1 : RxState::RD_PAYLOAD;
                 }
                 break;
 
@@ -311,8 +394,7 @@ void RadioTransport::_updateRx() {
                 break;
 
             case RxState::RD_CRC2: {
-                // Reconstruct and verify CRC
-                // Build a temp buffer for CRC check: [DEST SRC SEQ TYPE LEN PAYLOAD]
+                // Reconstruct and verify CRC: [DEST SRC SEQ TYPE LEN PAYLOAD]
                 uint8_t tmp[5 + RADIO_MAX_PAYLOAD];
                 tmp[0] = _rxPacket.dest;
                 tmp[1] = _rxPacket.src;
@@ -345,31 +427,50 @@ void RadioTransport::_updateRx() {
 }
 
 void RadioTransport::_processComplete() {
-    // --- ACK/NACK handling (terminates WAIT_ACK) ---
+    // --- ACK/NACK handling ---
+    // These are resolved immediately here so send() is unblocked without
+    // waiting for the next _updateTx() heartbeat tick.
     if (_rxPacket.type == PacketType::ACK || _rxPacket.type == PacketType::NACK) {
+        bool shouldUnblock = false;
+
+        xSemaphoreTake(_txMutex, portMAX_DELAY);
+
         if (_txState == TxState::WAIT_ACK &&
             _rxPacket.dest == _cfg.localAddr &&
             _rxPacket.len >= 1 &&
             _rxPacket.payload[0] == _txPacket.seq) {
             if (_rxPacket.type == PacketType::ACK) {
-                _txState = TxState::SUCCESS;
+                _txLastResult = true;
+                _txState = TxState::IDLE;
+                _stats.txPackets++;
+                if (_cfg.autoPowerEnabled && !_txBroadcast) {
+                    _findOrAllocSlave(_txPacket.dest);
+                }
+                shouldUnblock = true;
             } else {
-                // NACK: retry immediately
+                // NACK: retry or fail
                 if (_txRetriesLeft > 0) {
                     _txRetriesLeft--;
                     _txState = TxState::SENDING;
                 } else {
-                    _txState = TxState::FAILED;
+                    _txLastResult = false;
+                    _txState = TxState::IDLE;
+                    _stats.txFailed++;
+                    shouldUnblock = true;
                 }
             }
         }
+
+        xSemaphoreGive(_txMutex);
+
+        if (shouldUnblock) xSemaphoreGive(_ackEvent);
         return;  // ACK/NACK never delivered to application
     }
 
     // --- Duplicate detection ---
     if (_seqSeen[_rxPacket.src] &&
         _rxPacket.seq == _lastSeq[_rxPacket.src]) {
-        // Duplicate — discard payload, re-send ACK
+        // Duplicate -- discard payload, re-send ACK
         _stats.duplicates++;
         _sendAck(_rxPacket.src, _rxPacket.seq, true);
         return;
@@ -389,11 +490,13 @@ void RadioTransport::_processComplete() {
     if (_rxCallback) {
         _rxCallback(_rxPacket.src, _rxPacket.type, _rxPacket.payload, _rxPacket.len);
     } else if (!_rxEnqueue(_rxPacket)) {
-        // Queue full — packet dropped (stats could be added here)
+        // Queue full -- packet dropped
     }
 }
 
 void RadioTransport::_sendAck(uint8_t dest, uint8_t seq, bool ack) {
+    // Direct UART write: bypasses the TX state machine and _txMutex entirely.
+    // Safe to call from _processComplete() regardless of mutex state.
     RadioPacket ap;
     ap.dest = dest;
     ap.src = _cfg.localAddr;
@@ -410,11 +513,15 @@ void RadioTransport::_sendAck(uint8_t dest, uint8_t seq, bool ack) {
 }
 
 bool RadioTransport::_rxEnqueue(const RadioPacket& pkt) {
+    xSemaphoreTake(_rxMutex, portMAX_DELAY);
     uint8_t next = (_rxQHead + 1u) % HC12_RX_QUEUE_DEPTH;
-    if (next == _rxQTail) return false;  // full
-    _rxQueue[_rxQHead] = pkt;
-    _rxQHead = next;
-    return true;
+    bool ok = (next != _rxQTail);
+    if (ok) {
+        _rxQueue[_rxQHead] = pkt;
+        _rxQHead = next;
+    }
+    xSemaphoreGive(_rxMutex);
+    return ok;
 }
 
 // --- Auto-power control ---
@@ -423,7 +530,6 @@ RadioTransport::SlaveState* RadioTransport::_findOrAllocSlave(uint8_t addr) {
     for (uint8_t i = 0; i < HC12_MAX_SLAVES; i++) {
         if (_slaves[i].used && _slaves[i].addr == addr) return &_slaves[i];
     }
-    // Allocate new slot
     for (uint8_t i = 0; i < HC12_MAX_SLAVES; i++) {
         if (!_slaves[i].used) {
             _slaves[i].used = true;
@@ -451,17 +557,14 @@ void RadioTransport::runAutoPower(uint8_t slaveAddr) {
     bool changed = false;
 
     if (s->retryAccum >= _cfg.autoPowerHighThresh) {
-        // High retry rate -> increase power
         if (s->currentPower < _cfg.autoPowerMaxP) {
             s->currentPower++;
             changed = true;
         }
         s->cleanIntervalCount = 0;
     } else if (s->retryAccum == 0) {
-        // Clean interval -> increment clean counter
         s->cleanIntervalCount++;
         if (s->cleanIntervalCount >= _cfg.autoPowerCleanSteps) {
-            // Decrease power after enough clean intervals
             if (s->currentPower > _cfg.autoPowerMinP) {
                 s->currentPower--;
                 changed = true;
@@ -469,14 +572,11 @@ void RadioTransport::runAutoPower(uint8_t slaveAddr) {
             s->cleanIntervalCount = 0;
         }
     } else {
-        // Moderate retries -> stay, reset clean counter
         s->cleanIntervalCount = 0;
     }
 
-    // Reset accumulator for next interval
     s->retryAccum = 0;
 
-    // Apply the highest required power across all nodes to the hardware
     if (changed) {
         uint8_t globalMaxP = _cfg.autoPowerMinP;
         for (uint8_t i = 0; i < HC12_MAX_SLAVES; i++) {
@@ -486,7 +586,9 @@ void RadioTransport::runAutoPower(uint8_t slaveAddr) {
         }
 
         if (_driver->getConfig().power != globalMaxP) {
-            _driver->setPower(globalMaxP);
+            // Schedule the AT-mode power change for the next IDLE cycle in
+            // _updateTx() so it never runs while the mutex is held.
+            _pendingPower = globalMaxP;
         }
     }
 }
