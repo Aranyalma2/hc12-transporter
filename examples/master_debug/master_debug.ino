@@ -352,7 +352,6 @@ void setup() {
     if (!radio.begin(&Serial1, HC12_SET_PIN, HC12_RX_PIN, HC12_TX_PIN, hcCfg)) {
         Serial.println(ANSI_RED
                        "  HC-12 init FAILED -- check wiring and SET pin" ANSI_RESET);
-        while (true) delay(1000);
     }
     Serial.println(ANSI_GREEN "  HC-12 OK" ANSI_RESET);
 

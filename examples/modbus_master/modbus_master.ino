@@ -1,47 +1,62 @@
 /**
- * modbus_master.ino — Modbus RTU master via RadioTransport + ModbusBridge
+ * modbus_master.ino -- Modbus RTU master via RadioTransport + ModbusMaster
  *
- * Demonstrates:
- *  - ModbusBridge on the master side
- *  - Broadcast discovery of slave nodes and their Modbus addresses
- *  - Sending Modbus RTU read-holding-registers requests
- *  - Receiving and printing Modbus RTU responses
+ * Demonstrates two TX modes of ModbusMaster:
  *
- * Wiring:
- *   ESP32 GPIO17 (TX1) -> HC-12 RX
- *   ESP32 GPIO16 (RX1) -> HC-12 TX
- *   ESP32 GPIO4        -> HC-12 SET
+ *  Mode A -- API mode (default in this example):
+ *    Build Modbus RTU frames manually and call bridge.send().
+ *    Responses arrive in the bridge.receive() queue.
  *
- * The Modbus framing itself (building FC03 requests etc.) is done here
- * manually for illustration. Use a Modbus library for production.
+ *  Mode B -- Serial bridge mode (uncomment SERIAL_BRIDGE_MODE below):
+ *    Attach a second UART. Any Modbus RTU frame arriving on that UART is
+ *    forwarded over radio automatically. The response is written back to
+ *    the same UART. Your Modbus master software just uses a COM port.
+ *
+ * Route learning:
+ *    Unknown Modbus addresses are sent as broadcast. When the first response
+ *    arrives the master learns which radio slave serves that Modbus address.
+ *    Subsequent requests are sent unicast to that slave.
+ *    After 3 consecutive timeouts the route is evicted (broadcast again).
+ *
+ * Wiring (HC-12):
+ *   ESP32 GPIO33 (TX1) -> HC-12 RX
+ *   ESP32 GPIO32 (RX1) -> HC-12 TX
+ *   ESP32 GPIO12       -> HC-12 SET
+ *
+ * Wiring (Serial bridge, Mode B):
+ *   ESP32 GPIO17 (TX2) -> RS-485 / Modbus master device RX
+ *   ESP32 GPIO16 (RX2) -> RS-485 / Modbus master device TX
  */
 
 #include <HC12Transporter.h>
-#include <ModbusBridge.h>
+#include <radiobridges/ModbusMaster.h>
 
-// --- Pins ---
-static constexpr uint8_t HC12_SET_PIN = 4;
-static constexpr uint8_t HC12_RX_PIN = 16;
-static constexpr uint8_t HC12_TX_PIN = 17;
+// Uncomment to enable serial-bridge mode (see Mode B above)
+#define SERIAL_BRIDGE_MODE
+
+// --- HC-12 pins ---
+static constexpr uint8_t HC12_SET_PIN = 12;
+static constexpr uint8_t HC12_RX_PIN = 32;
+static constexpr uint8_t HC12_TX_PIN = 33;
 
 // --- Objects ---
 HC12Driver radio;
 RadioTransport transport;
-ModbusBridge bridge;
+ModbusMaster bridge;
 
-// --- Modbus CRC16 (standard Modbus poly 0x8005) for RTU frame integrity ---
+// --- Modbus CRC16 (standard poly 0xA001) ---
 static uint16_t modbusCRC(const uint8_t* data, uint8_t len) {
     uint16_t crc = 0xFFFF;
     for (uint8_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (uint8_t b = 0; b < 8; b++) {
-            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
+            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001u) : (uint16_t)(crc >> 1);
         }
     }
     return crc;
 }
 
-// Build a FC03 Read Holding Registers request frame
+// --- Build FC03 Read Holding Registers request ---
 static uint8_t buildFC03(uint8_t devAddr, uint16_t startReg, uint16_t count,
                          uint8_t* out) {
     out[0] = devAddr;
@@ -56,82 +71,102 @@ static uint8_t buildFC03(uint8_t devAddr, uint16_t startReg, uint16_t count,
     return 8;
 }
 
-// --- Polling state ---
-static uint8_t pollSlaves[] = {0x01, 0x02, 0x05};  // Modbus device addresses to poll
-static uint8_t pollCount = 3;
-static uint8_t pollIdx = 0;
-static uint32_t lastPollMs = 0;
-static bool waitingResponse = false;
-static uint32_t responseDue = 0;
-static uint8_t lastPollDev = 0;
+// --- Modbus addresses to poll (API mode) ---
+static constexpr uint8_t POLL_ADDRS[] = {0x01, 0x02, 0x05};
+static constexpr uint8_t POLL_COUNT = sizeof(POLL_ADDRS) / sizeof(POLL_ADDRS[0]);
 
 void setup() {
     Serial.begin(115200);
     Serial.println(F("[MASTER] Modbus bridge example"));
 
-    HC12Config hcCfg = {.channel = 5, .power = 8, .mode = HC12Mode::FU3, .baud = 19200};
+    pinMode(35, INPUT);
+
+    // --- HC-12 ---
+    HC12Config hcCfg;
+    hcCfg.channel = 5;
+    hcCfg.power = 8;
+    hcCfg.mode = HC12Mode::FU3;
+    hcCfg.baud = 19200;
+
     if (!radio.begin(&Serial1, HC12_SET_PIN, HC12_RX_PIN, HC12_TX_PIN, hcCfg)) {
         Serial.println(F("[MASTER] HC-12 FAILED"));
-        while (true) delay(1000);
     }
 
+    // --- Transport ---
     TransportConfig tCfg = TRANSPORT_DEFAULT_CONFIG;
     tCfg.localAddr = RADIO_ADDR_MASTER;
+    tCfg.retries = 3;
+    tCfg.ackTimeoutMs = 75;
     tCfg.autoPowerEnabled = true;
     tCfg.autoPowerIntervalMs = 5000;
+
     transport.begin(&radio, tCfg);
+    transport.startTask();
 
-    bridge.begin(&transport, RADIO_ADDR_MASTER);
+    // --- Modbus bridge ---
+    bridge.begin(&transport, 500 /* rxTimeoutMs */);
+    bridge.setMaxFailures(3);
 
-    // --- Discover slaves ---
-    Serial.println(F("[MASTER] Broadcasting discovery PING..."));
-    uint8_t found = bridge.discover(800);
-    Serial.printf("[MASTER] Found %d slave node(s)\n", found);
-
-    // You can also add static routes in case discovery is skipped:
-    // bridge.addRoute(0x01, 0x10);
-    // bridge.addRoute(0x02, 0x10);
-    // bridge.addRoute(0x05, 0x11);
+#ifdef SERIAL_BRIDGE_MODE
+    // Mode B: attach Serial2 as the Modbus UART bridge.
+    // Any Modbus master connected to Serial2 will talk through the radio.
+    Serial2.begin(9600, SERIAL_8N1, 5, 17);
+    bridge.attachSerial(&Serial2, 5 /* silenceMs */, 4 /* rstPin */);
+    bridge.startTask();
+    Serial.println(F("[MASTER] Serial bridge mode active on Serial2"));
+#else
+    // Mode A: API mode -- bridge.startTask() drives route learning and
+    // the receive() queue in the background.
+    bridge.startTask();
+    Serial.println(F("[MASTER] API mode active"));
+#endif
 }
 
 void loop() {
-    bridge.update();
+#ifdef SERIAL_BRIDGE_MODE
+    // In serial bridge mode the bridge task handles everything.
+    // loop() is free for other application logic.
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    // --- Check for a Modbus response ---
-    if (waitingResponse) {
-        ModbusFrame resp;
-        if (bridge.receiveModbus(&resp)) {
-            waitingResponse = false;
-            Serial.printf("[MASTER] Response from radio 0x%02X (%d bytes): ", resp.radioSrc, resp.len);
-            for (uint8_t i = 0; i < resp.len; i++) Serial.printf("%02X ", resp.data[i]);
-            Serial.println();
-        } else if (millis() > responseDue) {
-            // Application-level timeout (transport already retried)
-            Serial.printf("[MASTER] Timeout waiting for Modbus dev 0x%02X\n", lastPollDev);
-            waitingResponse = false;
-        }
-        return;
-    }
+#else
+    // --- API mode: poll each Modbus address every 1 second ---
+    static uint8_t pollIdx = 0;
+    static uint32_t lastPollMs = 0;
 
-    // --- Poll next slave every 500 ms ---
-    if (millis() - lastPollMs < 500) return;
+    if (millis() - lastPollMs < 1000) return;
     lastPollMs = millis();
 
-    uint8_t devAddr = pollSlaves[pollIdx];
-    pollIdx = (pollIdx + 1) % pollCount;
+    uint8_t devAddr = POLL_ADDRS[pollIdx];
+    pollIdx = (pollIdx + 1) % POLL_COUNT;
 
-    // Build FC03: read 2 holding registers starting at 0x0000
+    // Build and send an FC03 request for 2 registers starting at 0x0000.
     uint8_t frame[8];
     uint8_t flen = buildFC03(devAddr, 0x0000, 2, frame);
 
-    Serial.printf("[MASTER] Polling Modbus dev 0x%02X ... ", devAddr);
-    bool sent = bridge.sendModbus(devAddr, frame, flen);
-    if (!sent) {
-        Serial.println(F("No route / transport error"));
-        return;
+    uint8_t knownRadio = bridge.lookupRoute(devAddr);
+    Serial.printf("[MASTER] Polling Modbus 0x%02X (radio %s 0x%02X) ... ",
+                  devAddr,
+                  knownRadio ? ">" : "BC",
+                  knownRadio ? knownRadio : 0xFF);
+
+    // send() blocks until response or timeout.
+    bool ok = bridge.send(frame, flen);
+
+    if (ok) {
+        uint8_t resp[RADIO_MAX_PAYLOAD];
+        uint8_t rlen;
+        uint8_t radioSrc;
+
+        if (bridge.receive(resp, &rlen, &radioSrc)) {
+            Serial.printf("OK  radio=0x%02X  %d bytes:", radioSrc, rlen);
+            for (uint8_t i = 0; i < rlen; i++) Serial.printf(" %02X", resp[i]);
+            Serial.println();
+        }
+    } else {
+        Serial.println(F("TIMEOUT / NO ROUTE"));
     }
-    Serial.println(F("sent, waiting response..."));
-    lastPollDev = devAddr;
-    waitingResponse = true;
-    responseDue = millis() + 500;  // 500 ms application timeout
+#endif
+    if (digitalRead(35)) {
+        ESP.restart();
+    }
 }

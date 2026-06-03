@@ -62,7 +62,6 @@ void setup() {
 
     if (!radio.begin(&Serial1, HC12_SET_PIN, HC12_RX_PIN, HC12_TX_PIN, hcCfg)) {
         Serial.println(F("[MASTER] HC-12 init FAILED"));
-        while (true) delay(1000);
     }
     Serial.printf("[MASTER] HC-12 OK  ch=%d  p=%d  FU%d  baud=%lu\n",
                   hcCfg.channel, hcCfg.power, (int)hcCfg.mode, hcCfg.baud);

@@ -72,7 +72,6 @@ void setup() {
 
     if (!radio.begin(&Serial1, HC12_SET_PIN, HC12_RX_PIN, HC12_TX_PIN, hcCfg)) {
         Serial.println(F("[SLAVE] HC-12 init FAILED"));
-        while (true) delay(1000);
     }
     Serial.println(F("[SLAVE] HC-12 OK"));
 
@@ -93,7 +92,7 @@ void setup() {
         Serial.println(F("[SLAVE] startTask FAILED"));
         while (true) delay(1000);
     }
-    Serial.printf("[SLAVE 0x%02X] Transport ready (event-driven)\n", MY_RADIO_ADDR);
+    Serial.printf("[SLAVE 0x%02X] Transport ready\n", MY_RADIO_ADDR);
 }
 
 void loop() {
