@@ -8,15 +8,14 @@ Behaves like a wireless **UART** link with reliability features: CRC, ACK/retry,
 
 ## Features
 
-| Feature        | Details                                                 |
-| -------------- | ------------------------------------------------------- |
-| **Transport**  | CRC16-CCITT, ACK/NACK, 3 retries, seq-number dedup      |
-| **Addressing** | 1 master + up to 238 slaves, broadcast 0xFF             |
-| **Auto-power** | Per-slave adaptive TX power via retry-count heuristic   |
-| **Protocol**   | Payload-agnostic - send any bytes                       |
-| **Modbus**     | Optional `ModbusBridge` layer (not required)            |
-| **Memory**     | Zero dynamic allocation (`new` / `malloc` never called) |
-| **RTOS**       | Polling API by default; compatible with FreeRTOS tasks  |
+| Feature        | Details                                               |
+| -------------- | ----------------------------------------------------- |
+| **Transport**  | CRC16-CCITT, ACK/NACK, 3 retries, seq-number dedup    |
+| **Addressing** | 1 master + up to 238 slaves, broadcast 0xFF           |
+| **Auto-power** | Per-slave adaptive TX power via retry-count heuristic |
+| **Protocol**   | Payload-agnostic - send any bytes                     |
+| **Modbus**     | Optional `ModbusBridge` layer (not required)          |
+| **RTOS**       | Uses FreeRTOS architecture                            |
 
 ---
 
