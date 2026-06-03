@@ -20,6 +20,9 @@
 #include "RadioTransport.h"
 
 #include "CRC16.h"
+#include "esp_log.h"
+
+static const char* TAG_RT = "RadioTransport";
 
 // --- Packet encode / decode (RadioPacket methods) ---
 
@@ -253,7 +256,13 @@ void RadioTransport::_updateTx() {
             }
 
             _stats.retries += (_txRetriesLeft < _cfg.retries) ? 1u : 0u;
+            if (_txRetriesLeft < _cfg.retries) {
+                ESP_LOGD(TAG_RT, "TX retry seq=0x%02X dest=0x%02X retriesLeft=%d",
+                         _txPacket.seq, _txPacket.dest, _txRetriesLeft);
+            }
             _doSend(_txPacket);  // encode + UART write only, no blocking delay
+            ESP_LOGD(TAG_RT, "TX sent seq=0x%02X dest=0x%02X type=0x%02X len=%d",
+                     _txPacket.seq, _txPacket.dest, (uint8_t)_txPacket.type, _txPacket.len);
 
             if (_txBroadcast) {
                 _txLastTxMs = millis();
@@ -282,11 +291,15 @@ void RadioTransport::_updateTx() {
                     SlaveState* s = _findOrAllocSlave(_txPacket.dest);
                     if (s) s->retryAccum++;
                     _txState = TxState::SENDING;
+                    ESP_LOGD(TAG_RT, "TX ACK timeout seq=0x%02X dest=0x%02X -- retrying (%d left)",
+                             _txPacket.seq, _txPacket.dest, _txRetriesLeft);
                 } else {
                     // All retries exhausted -- fail and unblock send().
                     _txLastResult = false;
                     _txState = TxState::IDLE;
                     _stats.txFailed++;
+                    ESP_LOGW(TAG_RT, "TX FAILED seq=0x%02X dest=0x%02X -- all retries exhausted",
+                             _txPacket.seq, _txPacket.dest);
                     xSemaphoreGive(_txMutex);
                     xSemaphoreGive(_ackEvent);
                     return;  // mutex already released
@@ -410,6 +423,8 @@ void RadioTransport::_updateRx() {
 
                 if (crcCalc != crcRecv) {
                     _stats.crcErrors++;
+                    ESP_LOGW(TAG_RT, "RX CRC error src=0x%02X dest=0x%02X seq=0x%02X",
+                             _rxPacket.src, _rxPacket.dest, _rxPacket.seq);
                     break;
                 }
 
@@ -443,6 +458,8 @@ void RadioTransport::_processComplete() {
                 _txLastResult = true;
                 _txState = TxState::IDLE;
                 _stats.txPackets++;
+                ESP_LOGD(TAG_RT, "RX ACK seq=0x%02X src=0x%02X -- TX success",
+                         _rxPacket.seq, _rxPacket.src);
                 if (_cfg.autoPowerEnabled && !_txBroadcast) {
                     _findOrAllocSlave(_txPacket.dest);
                 }
@@ -452,11 +469,15 @@ void RadioTransport::_processComplete() {
                 if (_txRetriesLeft > 0) {
                     _txRetriesLeft--;
                     _txState = TxState::SENDING;
+                    ESP_LOGD(TAG_RT, "RX NACK seq=0x%02X src=0x%02X -- retrying",
+                             _rxPacket.seq, _rxPacket.src);
                 } else {
                     _txLastResult = false;
                     _txState = TxState::IDLE;
                     _stats.txFailed++;
                     shouldUnblock = true;
+                    ESP_LOGW(TAG_RT, "RX NACK seq=0x%02X src=0x%02X -- TX FAILED (no retries)",
+                             _rxPacket.seq, _rxPacket.src);
                 }
             }
         }
@@ -472,6 +493,8 @@ void RadioTransport::_processComplete() {
         _rxPacket.seq == _lastSeq[_rxPacket.src]) {
         // Duplicate -- discard payload, re-send ACK
         _stats.duplicates++;
+        ESP_LOGD(TAG_RT, "RX duplicate seq=0x%02X src=0x%02X -- re-ACKing",
+                 _rxPacket.seq, _rxPacket.src);
         _sendAck(_rxPacket.src, _rxPacket.seq, true);
         return;
     }
@@ -485,12 +508,16 @@ void RadioTransport::_processComplete() {
     }
 
     _stats.rxPackets++;
+    ESP_LOGD(TAG_RT, "RX pkt src=0x%02X dest=0x%02X seq=0x%02X type=0x%02X len=%d",
+             _rxPacket.src, _rxPacket.dest, _rxPacket.seq,
+             (uint8_t)_rxPacket.type, _rxPacket.len);
 
     // --- Deliver to application ---
     if (_rxCallback) {
         _rxCallback(_rxPacket.src, _rxPacket.type, _rxPacket.payload, _rxPacket.len);
     } else if (!_rxEnqueue(_rxPacket)) {
-        // Queue full -- packet dropped
+        ESP_LOGW(TAG_RT, "RX queue full -- packet dropped src=0x%02X seq=0x%02X",
+                 _rxPacket.src, _rxPacket.seq);
     }
 }
 
