@@ -88,6 +88,11 @@ bool RadioTransport::begin(HC12Driver* driver, const TransportConfig& cfg) {
     _txLastTxMs = 0;
     _pendingPower = 0;
 
+    // Initialise cipher unconditionally.
+    // Key defaults to all-zero bytes if not set in cfg - replace with your own key.
+    _cipher.init(cfg.encryptionKey);
+    ESP_LOGI("RadioTransport", "AES-128-CTR encryption initialised");
+
     return true;
 }
 
@@ -207,6 +212,13 @@ bool RadioTransport::_sendAsyncInternal(uint8_t dest, PacketType type,
     _txPacket.type = type;
     _txPacket.len = plen;
     if (plen > 0) memcpy(_txPacket.payload, data, plen);
+
+    // Encrypt DATA payload in place before queuing for TX.
+    if (type == PacketType::DATA && plen > 0) {
+        uint8_t nonce[RadioCipher::NONCE_SIZE] = {
+            _txPacket.dest, _txPacket.src, _txPacket.seq};
+        _cipher.crypt(nonce, _txPacket.payload, plen);
+    }
 
     _txRetriesLeft = _cfg.retries;
     _txBroadcast = (dest == RADIO_ADDR_BROADCAST);
@@ -511,6 +523,15 @@ void RadioTransport::_processComplete() {
     ESP_LOGD(TAG_RT, "RX pkt src=0x%02X dest=0x%02X seq=0x%02X type=0x%02X len=%d",
              _rxPacket.src, _rxPacket.dest, _rxPacket.seq,
              (uint8_t)_rxPacket.type, _rxPacket.len);
+
+    // --- Decrypt payload before delivering to the application ---
+    // Performed after CRC, address filter, duplicate detection, and ACK.
+    // Only DATA frames carry encrypted application payload.
+    if (_rxPacket.type == PacketType::DATA && _rxPacket.len > 0) {
+        uint8_t nonce[RadioCipher::NONCE_SIZE] = {
+            _rxPacket.dest, _rxPacket.src, _rxPacket.seq};
+        _cipher.crypt(nonce, _rxPacket.payload, _rxPacket.len);
+    }
 
     // --- Deliver to application ---
     if (_rxCallback) {

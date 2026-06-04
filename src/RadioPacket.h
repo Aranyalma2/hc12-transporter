@@ -56,7 +56,7 @@ enum class PacketType : uint8_t {
 /**
  * @brief In-memory representation of one radio packet.
  *
- * Not the wire layout — use RadioPacket::encode() / decode() to
+ * Not the wire layout - use RadioPacket::encode() / decode() to
  * convert to/from the flat byte array that goes over the air.
  */
 struct RadioPacket {
@@ -69,7 +69,7 @@ struct RadioPacket {
 
     /**
      * @brief Serialise this packet into buf[].
-     * @param buf  Output buffer — must be at least RADIO_MAX_FRAME bytes.
+     * @param buf  Output buffer - must be at least RADIO_MAX_FRAME bytes.
      * @return     Number of bytes written.
      */
     uint8_t encode(uint8_t* buf) const;
