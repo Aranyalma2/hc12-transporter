@@ -41,6 +41,7 @@
 #include <freertos/task.h>
 
 #include "HC12Driver.h"
+#include "RadioCipher.h"
 #include "RadioPacket.h"
 
 // --- Types ---
@@ -88,6 +89,10 @@ struct TransportConfig {
     uint16_t autoPowerIntervalMs;  /// ms between power-adjustment evaluations (default 5000)
     uint8_t autoPowerHighThresh;   /// Retries/interval triggering a power increase (default 2)
     uint8_t autoPowerCleanSteps;   /// Clean intervals before power decrease (default 3)
+
+    // Encryption (AES-128-CTR, payload only - always active)
+    uint8_t encryptionKey[16];  /// Pre-shared 128-bit key. Set before begin(); immutable after.
+                                /// Defaults to all-zero bytes (functional but not secret).
 };
 
 /** @brief Sensible defaults. */
@@ -103,6 +108,7 @@ static constexpr TransportConfig TRANSPORT_DEFAULT_CONFIG = {
     .autoPowerIntervalMs = 5000,
     .autoPowerHighThresh = 2,
     .autoPowerCleanSteps = 12,
+    .encryptionKey = {},
 };
 
 // --- Link Statistics ---
@@ -335,6 +341,9 @@ class RadioTransport {
     SemaphoreHandle_t _txTrigger = nullptr;  /// Given by sendAsync() to wake task
 
     uint8_t _pendingPower = 0;  /// Deferred setPower() target (0 = no change pending)
+
+    // --- Encryption ---
+    RadioCipher _cipher;  /// AES-128-CTR context
 
     // --- Dependencies and config ---
     HC12Driver* _driver = nullptr;

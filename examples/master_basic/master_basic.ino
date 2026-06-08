@@ -27,6 +27,12 @@ static constexpr uint8_t HC12_TX_PIN = 33;
 // --- Radio addresses ---
 static constexpr uint8_t SLAVE_ADDR = 0x10;
 
+// --- Shared AES-128 key (must be identical on every node in the network) ---
+// Replace with your own 16 random bytes. Keep this secret.
+static const uint8_t SHARED_KEY[16] = {
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
+
 // --- Objects ---
 HC12Driver radio;
 RadioTransport transport;
@@ -75,6 +81,9 @@ void setup() {
     tCfg.autoPowerMinP = 2;
     tCfg.autoPowerMaxP = 8;
     tCfg.autoPowerIntervalMs = 5000;
+    // AES-128-CTR encryption is always active. Set your pre-shared key here.
+    // All nodes in the network must use the same key.
+    memcpy(tCfg.encryptionKey, SHARED_KEY, 16);
 
     transport.begin(&radio, tCfg);
 

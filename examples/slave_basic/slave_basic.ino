@@ -27,6 +27,12 @@ static constexpr uint8_t HC12_TX_PIN = 33;
 // --- This slave's radio address (must be 0x10-0xFE, unique per network) ---
 static constexpr uint8_t MY_RADIO_ADDR = 0x10;
 
+// --- Shared AES-128 key (must be identical on every node in the network) ---
+// Replace with your own 16 random bytes. Keep this secret.
+static const uint8_t SHARED_KEY[16] = {
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF};
+
 // --- Objects ---
 HC12Driver radio;
 RadioTransport transport;
@@ -46,9 +52,9 @@ static void onPacket(uint8_t src, PacketType type,
             // Reply with a PONG carrying this node's radio address.
             Serial.printf("[SLAVE] PING from 0x%02X -> PONG\n", src);
             {
-                // Payload: [my_radio_addr, 0 local Modbus devices in basic example]
-                uint8_t pong[2] = {MY_RADIO_ADDR, 0};
-                transport.sendAsync(src, PacketType::PONG, pong, 2);
+                // Payload: [my_radio_addr]
+                uint8_t pong[1] = {MY_RADIO_ADDR};
+                transport.sendAsync(src, PacketType::PONG, pong, 1);
             }
             break;
 
@@ -81,6 +87,9 @@ void setup() {
     tCfg.retries = 3;
     tCfg.ackTimeoutMs = 75;
     tCfg.autoPowerEnabled = false;  // Enable autoPower here to also optimise the slave->master uplink
+    // AES-128-CTR encryption is always active. Set your pre-shared key here.
+    // All nodes in the network must use the same key.
+    memcpy(tCfg.encryptionKey, SHARED_KEY, 16);
 
     transport.begin(&radio, tCfg);
 
