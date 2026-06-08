@@ -287,8 +287,11 @@ void ModbusMaster::_runTask() {
             while (_transport->receive(&src, &type, data, &len)) {
                 if (type == PacketType::DATA) {
                     _processReceivedPacket(src, data, len);
+                } else if (type == PacketType::PING) {
+                    // Just reply to PINGs with PONGs
+                    _transport->send(src, PacketType::PONG, nullptr, 0);
                 }
-                // Other packet types (PING, PONG, STATUS) are ignored by the bridge.
+                // Other packet types (PONG, STATUS) are ignored by the bridge.
             }
         }
 

@@ -140,6 +140,9 @@ void ModbusSlave::_runTask() {
             while (_transport->receive(&src, &type, data, &len)) {
                 if (type == PacketType::DATA && len > 0) {
                     _handleRequest(src, data, len);
+                } else if (type == PacketType::PING) {
+                    // Just reply to PINGs with PONGs
+                    _transport->send(src, PacketType::PONG, nullptr, 0);
                 }
                 // Other packet types (PING, PONG, STATUS) ignored by the slave bridge.
             }
