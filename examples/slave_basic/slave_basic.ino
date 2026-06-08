@@ -52,9 +52,9 @@ static void onPacket(uint8_t src, PacketType type,
             // Reply with a PONG carrying this node's radio address.
             Serial.printf("[SLAVE] PING from 0x%02X -> PONG\n", src);
             {
-                // Payload: [my_radio_addr, 0 local Modbus devices in basic example]
-                uint8_t pong[2] = {MY_RADIO_ADDR, 0};
-                transport.sendAsync(src, PacketType::PONG, pong, 2);
+                // Payload: [my_radio_addr]
+                uint8_t pong[1] = {MY_RADIO_ADDR};
+                transport.sendAsync(src, PacketType::PONG, pong, 1);
             }
             break;
 

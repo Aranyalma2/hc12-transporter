@@ -34,18 +34,16 @@ Behaves like a wireless **UART** link with reliability features: CRC, ACK/retry,
 - **CRC16-CCITT** covers `DEST..PAYLOAD` (not SOF or CRC bytes themselves)
 - Max frame: 72 bytes -> comfortable within HC-12 FU3 throughput at 19200 baud
 
-```
-
 ---
 
 ## HC-12 Configuration
 
-| Parameter | Range | Default | AT Command |
-|---|---|---|---|
-| Channel | 1–127 | 5 | `AT+C005` |
-| TX Power | 1–8 | 8 (20 dBm) | `AT+P8` |
-| FU Mode | FU1–FU4 | FU3 | `AT+FU3` |
-| Baud | 1200–115200 | 19200 | `AT+B19200` |
+| Parameter | Range       | Default    | AT Command  |
+| --------- | ----------- | ---------- | ----------- |
+| Channel   | 1–127       | 5          | `AT+C005`   |
+| TX Power  | 1–8         | 8 (20 dBm) | `AT+P8`     |
+| FU Mode   | FU1–FU4     | FU3        | `AT+FU3`    |
+| Baud      | 1200–115200 | 19200      | `AT+B19200` |
 
 AT commands are typically processed at **9600 baud**, but the library dynamically scans all standard baud rates during `begin()` to safely auto-detect and sync AT-mode parameters regardless of the module's unknown prior state.
 
@@ -68,15 +66,15 @@ Check current logical power for a slave: `transport.slavePower(0x10)` -> `1–8`
 
 ## Timing Defaults
 
-| Parameter | Default |
-|---|---|
-| ACK timeout | 75 ms |
-| Retries per send | 3 |
-| TX->RX switch delay | 10 ms |
-| Inter-packet gap | 10 ms |
+| Parameter           | Default |
+| ------------------- | ------- |
+| ACK timeout         | 75 ms   |
+| Retries per send    | 3       |
+| TX->RX switch delay | 10 ms   |
+| Inter-packet gap    | 10 ms   |
 | Auto-power interval | 5000 ms |
-| AT entry delay | 40 ms |
-| AT exit delay | 80 ms |
+| AT entry delay      | 40 ms   |
+| AT exit delay       | 80 ms   |
 
 ---
 
@@ -91,15 +89,14 @@ Check current logical power for a slave: `transport.slavePower(0x10)` -> `1–8`
 
 ## Recommended Limits
 
-| Parameter | Value |
-|---|---|
-| Max payload | 64 bytes |
-| UART baud | 19200 |
-| Retry count | 3 |
-| ACK timeout | 75 ms |
-| Max slaves tracked | 32 (`HC12_MAX_SLAVES`) |
-| RX queue depth | 4 (`HC12_RX_QUEUE_DEPTH`) |
+| Parameter          | Value                            |
+| ------------------ | -------------------------------- |
+| Max payload        | 64 bytes                         |
+| UART baud          | 19200                            |
+| Retry count        | 3                                |
+| ACK timeout        | 75 ms                            |
+| Max slaves tracked | 32 (`HC12_MAX_SLAVES`)           |
+| RX queue depth     | 4 (`HC12_RX_QUEUE_DEPTH`)        |
 | Master route table | 64 entries (`MODBUS_MAX_ROUTES`) |
 
 All are `#define` overridable before including the headers.
-```
