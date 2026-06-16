@@ -5,11 +5,85 @@
 
 #include "ModbusMaster.h"
 
+#include <esp_log.h>
 #include <string.h>
 
-#include "esp_log.h"
-
 static const char* TAG_MM = "ModbusMaster";
+
+// ---------------------------------------------------------------------------
+// Modbus RTU frame helpers (file-local)
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Compute Modbus RTU CRC-16 (polynomial 0xA001, init 0xFFFF).
+ * @param buf  Data bytes (NOT including the two CRC bytes themselves).
+ * @param len  Number of data bytes.
+ * @return 16-bit CRC, little-endian byte order as stored in the frame.
+ */
+static uint16_t _modbusRtuCrc(const uint8_t* buf, uint8_t len) {
+    uint16_t crc = 0xFFFFu;
+    for (uint8_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (uint8_t b = 0; b < 8; b++) {
+            crc = (crc & 0x0001u) ? ((crc >> 1) ^ 0xA001u) : (crc >> 1);
+        }
+    }
+    return crc;
+}
+
+/**
+ * @brief Locate and validate a Modbus RTU frame inside a potentially noisy
+ *        byte buffer.
+ *
+ * Handles two common RS-485 / UART noise patterns:
+ *  1. **Leading 0x00 bytes** -- spurious nulls that appear before the device
+ *     address byte are skipped.
+ *  2. **Trailing garbage bytes** -- extra bytes appended after the real frame
+ *     are stripped by trying progressively shorter lengths until a CRC-16
+ *     match is found (longest valid match wins).
+ *
+ * A candidate frame is additionally rejected when:
+ *  - Device address is 0 or outside the standard range 1-247.
+ *  - Function code is 0 or in the exception-response range (>= 0x80).
+ *
+ * @param buf    Raw buffer received from the serial port.
+ * @param len    Number of bytes in buf.
+ * @param out    Output buffer for the cleaned frame (must be >= len bytes).
+ * @return       Length of the cleaned frame (>= 4) or 0 if no valid frame
+ *               could be found.
+ */
+static uint8_t _parseModbusFrame(const uint8_t* buf, uint8_t len,
+                                  uint8_t* out) {
+    // --- Step 1: skip leading 0x00 noise bytes ---
+    uint8_t start = 0;
+    while (start < len && buf[start] == 0x00u) start++;
+
+    const uint8_t* p = buf + start;
+    uint8_t avail = len - start;
+
+    if (avail < 4u) return 0u;  // too short for addr + FC + 2-byte CRC
+
+    // --- Step 2: try lengths from avail down to 4, longest valid match wins ---
+    for (uint8_t tryLen = avail; tryLen >= 4u; tryLen--) {
+        // CRC is stored little-endian in the last two bytes.
+        uint16_t crcStored = (uint16_t)p[tryLen - 2u] |
+                             ((uint16_t)p[tryLen - 1u] << 8u);
+        uint16_t crcCalc   = _modbusRtuCrc(p, (uint8_t)(tryLen - 2u));
+
+        if (crcCalc != crcStored) continue;
+
+        // Sanity-check device address and function code.
+        uint8_t addr = p[0];
+        uint8_t fc   = p[1];
+        if (addr < 1u || addr > 247u) continue;  // invalid device address
+        if (fc  < 1u || fc  > 127u)  continue;  // 0 invalid; >= 0x80 = exception
+
+        memcpy(out, p, tryLen);
+        return tryLen;
+    }
+
+    return 0u;  // no valid frame found
+}
 
 // --- Lifecycle ---
 
@@ -99,7 +173,22 @@ bool ModbusMaster::send(const uint8_t* frame, uint8_t len) {
 }
 
 bool ModbusMaster::_sendFrame(const uint8_t* frame, uint8_t len) {
-    if (!_transport || len < 1 || len > RADIO_MAX_PAYLOAD) return false;
+    if (!_transport || len < 4 || len > RADIO_MAX_PAYLOAD) return false;
+
+    // --- Validate and strip noise from the raw frame ---
+    // Strip leading 0x00 bytes and trailing garbage; verify Modbus CRC-16.
+    uint8_t cleanBuf[RADIO_MAX_PAYLOAD];
+    uint8_t cleanLen = _parseModbusFrame(frame, len, cleanBuf);
+    if (cleanLen == 0u) {
+        ESP_LOGW(TAG_MM, "_sendFrame: rejected -- no valid Modbus RTU frame "
+                         "in %d raw bytes", len);
+        return false;
+    }
+    if (cleanLen != len) {
+        ESP_LOGD(TAG_MM, "_sendFrame: noise stripped %d -> %d bytes", len, cleanLen);
+    }
+    frame = cleanBuf;
+    len   = cleanLen;
 
     uint8_t mbAddr = frame[0];
 

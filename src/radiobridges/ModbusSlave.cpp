@@ -5,9 +5,8 @@
 
 #include "ModbusSlave.h"
 
+#include <esp_log.h>
 #include <string.h>
-
-#include "esp_log.h"
 
 static const char* TAG_MS = "ModbusSlave";
 
