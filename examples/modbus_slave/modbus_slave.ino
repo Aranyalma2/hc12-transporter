@@ -38,6 +38,7 @@ static constexpr uint8_t HC12_TX_PIN = 33;
 
 // --- This slave's radio address ---
 static constexpr uint8_t MY_RADIO_ADDR = 0x10;
+static const uint8_t SHARED_KEY[16] = {0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30}; // "0000000000000000"
 
 // --- Objects ---
 HC12Driver radio;
@@ -125,6 +126,7 @@ void setup() {
     tCfg.retries = 3;
     tCfg.ackTimeoutMs = 75;
     tCfg.autoPowerEnabled = false;
+    memcpy(tCfg.encryptionKey, SHARED_KEY, 16);
 
     transport.begin(&radio, tCfg);
     transport.startTask();

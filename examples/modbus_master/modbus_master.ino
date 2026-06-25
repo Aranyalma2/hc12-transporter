@@ -39,6 +39,8 @@ static constexpr uint8_t HC12_SET_PIN = 12;
 static constexpr uint8_t HC12_RX_PIN = 32;
 static constexpr uint8_t HC12_TX_PIN = 33;
 
+static const uint8_t SHARED_KEY[16] = {0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30};  // "0000000000000000"
+
 // --- Objects ---
 HC12Driver radio;
 RadioTransport transport;
@@ -99,6 +101,7 @@ void setup() {
     tCfg.ackTimeoutMs = 75;
     tCfg.autoPowerEnabled = true;
     tCfg.autoPowerIntervalMs = 5000;
+    memcpy(tCfg.encryptionKey, SHARED_KEY, 16);
 
     transport.begin(&radio, tCfg);
     transport.startTask();

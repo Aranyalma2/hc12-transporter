@@ -44,6 +44,7 @@
 /** Radio addresses of the slaves to monitor. Add/remove as needed. */
 static const uint8_t SLAVE_ADDRS[] = {0x10, 0x11};
 static constexpr uint8_t SLAVE_COUNT = sizeof(SLAVE_ADDRS) / sizeof(SLAVE_ADDRS[0]);
+static const uint8_t SHARED_KEY[16] = {0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30}; // "0000000000000000"
 
 // HC-12 hardware pins
 static constexpr uint8_t HC12_SET_PIN = 12;
@@ -361,6 +362,7 @@ void setup() {
     tCfg.retries = MAX_RETRIES;
     tCfg.ackTimeoutMs = 75;
     tCfg.autoPowerEnabled = true;
+    memcpy(tCfg.encryptionKey, SHARED_KEY, 16);
     tCfg.autoPowerMinP = 1;
     tCfg.autoPowerMaxP = 8;
     tCfg.autoPowerIntervalMs = REPORT_INTERVAL_MS;
